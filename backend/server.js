@@ -179,43 +179,62 @@ app.get("/parts", (req, res) => {
 });
 
 // Save invoice details
-app.post("/save-invoice", (req, res) => {
+app.post("/save-invoice", async (req, res) => {
   const { customerDetails, selectedParts } = req.body;
 
-  const query = `INSERT INTO invoices (name, address, contact, email, model, reg_no, invoice_date) VALUES (?, ?, ?, ?, ?, ?, ?)`;
-  const values = [
-    customerDetails.name,
-    customerDetails.address,
-    customerDetails.contact,
-    customerDetails.email,
-    customerDetails.model,
-    customerDetails.regNo,
-    customerDetails.invoiceDate,
-  ];
+  try {
+    // Insert invoice
+    const invoiceQuery = `
+      INSERT INTO invoices 
+      (name, address, contact, email, model, reg_no, invoice_date) 
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `;
+    
+    const invoiceValues = [
+      customerDetails.name,
+      customerDetails.address,
+      customerDetails.contact,
+      customerDetails.email,
+      customerDetails.model,
+      customerDetails.regNo,
+      customerDetails.invoiceDate
+    ];
 
-  db.query(query, values, (err, result) => {
-    if (err) {
-      console.error("Error inserting invoice:", err);
-      return res.status(500).send("Database error");
+    // Using promise-based query
+    const [invoiceResult] = await db.promise().query(invoiceQuery, invoiceValues);
+    const invoiceId = invoiceResult.insertId;
+
+    // Insert each part
+    for (const part of selectedParts) {
+      const partQuery = `
+        INSERT INTO invoice_parts 
+        (invoice_id, part_no, part_description, qty, rate, sgst, cgst) 
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `;
+      
+      const partValues = [
+        invoiceId,
+        part.part_no || '',
+        part.part_description || '',
+        part.quantity || 1,
+        part.rate || 0,
+        part.sgst || 0,
+        part.cgst || 0
+      ];
+
+      await db.promise().query(partQuery, partValues);
     }
 
-    const invoiceId = result.insertId;
-
-    // Insert parts into a separate table linked to this invoice
-    selectedParts.forEach((part) => {
-      db.query(
-        `INSERT INTO invoice_parts (invoice_id, part_no, part_description, qty, rate, sgst) VALUES (?, ?, ?, ?, ?, ?)`,
-        [invoiceId, part.part_no, part.part_description, part.qty, part.rate, part.sgst],
-        (err) => {
-          if (err) console.error("Error inserting parts:", err);
-        }
-      );
+    res.status(200).json({ 
+      message: "Invoice saved successfully",
+      invoiceId: invoiceId
     });
 
-    res.status(200).send("Invoice saved successfully");
-  });
+  } catch (error) {
+    console.error("Error saving invoice:", error);
+    res.status(500).send("Database error");
+  }
 });
-
 
 app.get("/invoice/:invoice_id", (req, res) => {
   const { invoice_id } = req.params;
@@ -574,6 +593,63 @@ app.get('/parts/:id', async (req, res) => {
 });
 
 
+// Add this to your server.js or routes file
+function queryAsync(sql, params) {
+  return new Promise((resolve, reject) => {
+    db.query(sql, params, (err, results) => {
+      if (err) return reject(err);
+      resolve(results);
+    });
+  });
+}
+
+// Search Invoices Endpoint
+app.get('/search-invoices', async (req, res) => {
+  try {
+    const { name } = req.query;
+    
+    if (!name) {
+      return res.status(400).json({ error: 'Name parameter is required' });
+    }
+
+    // Get invoices with their summary data
+    const invoices = await queryAsync(
+      `SELECT i.*, s.subtotal, s.cgst, s.sgst, s.total_due as total_amount
+       FROM invoices i
+       JOIN invoice_summary s ON i.name = s.customer_name AND i.invoice_date = s.invoice_date
+       WHERE i.name LIKE ? 
+       ORDER BY i.invoice_date DESC`,
+      [`%${name}%`]
+    );
+
+    // Get parts for each invoice
+    const invoicesWithParts = await Promise.all(
+      invoices.map(async (invoice) => {
+        const parts = await queryAsync(
+          `SELECT * FROM invoice_parts WHERE invoice_id = ?`,
+          [invoice.invoice_id]
+        );
+        return { 
+          ...invoice,
+          parts,
+          // These values now come from invoice_summary
+          subtotal: Number(invoice.subtotal).toFixed(2),
+          cgst: Number(invoice.cgst).toFixed(2),
+          sgst: Number(invoice.sgst).toFixed(2),
+          total_amount: Number(invoice.total_amount).toFixed(2)
+        };
+      })
+    );
+
+    res.json(invoicesWithParts);
+  } catch (error) {
+    console.error('Error searching invoices:', error);
+    res.status(500).json({ 
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
 
 
 // Start Server
