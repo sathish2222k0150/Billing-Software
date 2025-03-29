@@ -20,7 +20,7 @@ const db = mysql.createPool({
   database: process.env.DB_NAME,
   port: process.env.DB_PORT || 3306, // Default MySQL port
   waitForConnections: true,
-  connectionLimit: 10, // Allow up to 10 concurrent connections
+  connectionLimit: 100, // Allow up to 10 concurrent connections
   queueLimit: 0,
 });
 
@@ -650,6 +650,288 @@ app.get('/search-invoices', async (req, res) => {
     });
   }
 });
+
+
+
+app.post('/service-estimate', async (req, res) => {
+  let connection;
+  try {
+    const { customerDetails, selectedParts, totalDue } = req.body;
+    
+    // Validate required fields including totalDue
+    if (!customerDetails?.name || !selectedParts || !Array.isArray(selectedParts) || 
+        totalDue === undefined || totalDue === null) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields or invalid total amount'
+      });
+    }
+
+    connection = await db.promise().getConnection();
+    await connection.beginTransaction();
+    
+    // Calculate total on server side for double verification
+    const calculatedTotal = selectedParts.reduce((sum, part) => {
+      return sum + (Number(part.rate || 0) * (Number(part.quantity || 1)));
+    }, 0);
+
+    // Use the calculated total (or the provided totalDue if you prefer)
+    const finalTotal = calculatedTotal;
+
+    const [estimateResult] = await connection.query(
+      `INSERT INTO estimates 
+      (customer_name, customer_address, customer_contact, customer_email, 
+       vehicle_model, vehicle_reg_no, estimate_date, total_amount) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        customerDetails.name,
+        customerDetails.address || null,
+        customerDetails.contact || null,
+        customerDetails.email || null,
+        customerDetails.model || null,
+        customerDetails.regNo || null,
+        customerDetails.estimateDate || new Date().toISOString().split('T')[0],
+        finalTotal  // Using the calculated total
+      ]
+    );
+    
+    const estimateId = estimateResult.insertId;
+    const partsValues = selectedParts.map(part => [
+      estimateId,
+      part.part_no,
+      part.part_description || null,
+      part.hsn_sac || null,
+      part.rate || 0,
+      part.quantity || 1,
+      (part.rate || 0) * (part.quantity || 1)
+    ]);
+
+    if (partsValues.length > 0) {
+      await connection.query(
+        `INSERT INTO estimate_parts 
+        (estimate_id, part_no, part_description, hsn_sac, rate, quantity, amount) 
+        VALUES ?`,
+        [partsValues]
+      );
+    }
+    
+    await connection.commit();
+    
+    res.json({
+      success: true,
+      message: 'Estimate saved successfully',
+      estimateId
+    });
+    
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.error('Error saving estimate:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to save estimate',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+/**
+ * @route POST /estimate-summary
+ * @desc Save estimate summary data
+ */
+app.post('/estimate-summary', async (req, res) => {
+  try {
+    const { customerName, estimateDate, totalDue } = req.body;
+
+    if (!customerName || !estimateDate || totalDue === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields'
+      });
+    }
+
+    const [result] = await db.promise().query(
+      `INSERT INTO estimate_summary 
+      (customer_name, estimate_date, total_amount) 
+      VALUES (?, ?, ?)`,
+      [customerName, estimateDate, totalDue]
+    );
+    
+    res.json({ 
+      success: true, 
+      message: 'Estimate summary saved',
+      id: result.insertId 
+    });
+    
+  } catch (error) {
+    console.error('Error saving estimate summary:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to save summary',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
+ * @route GET /latest-estimate-id
+ * @desc Get the latest estimate ID
+ */
+app.get('/latest-estimate-id', async (req, res) => {
+  try {
+    const [rows] = await db.promise().query(
+      'SELECT id AS estimateId FROM estimates ORDER BY id DESC LIMIT 1'
+    );
+    
+    res.json({ 
+      success: true,
+      estimateId: rows.length > 0 ? rows[0].estimateId : 1000
+    });
+  } catch (error) {
+    console.error('Error fetching latest estimate ID:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to fetch estimate ID',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+
+
+app.get('/search-estimates', async (req, res) => {
+  try {
+    const { name } = req.query;
+    
+    if (!name) {
+      return res.status(400).json({
+        success: false,
+        message: 'Customer name is required'
+      });
+    }
+
+    // Search estimates by customer name
+    const [estimates] = await db.promise().query(
+      `SELECT 
+        e.id,
+        e.customer_name as name,
+        e.customer_address as address,
+        e.customer_contact as contact,
+        e.customer_email as email,
+        e.vehicle_model as model,
+        e.vehicle_reg_no as reg_no,
+        e.estimate_date,
+        e.total_amount
+      FROM estimates e 
+      WHERE e.customer_name LIKE ? 
+      ORDER BY e.estimate_date DESC`,
+      [`%${name}%`]
+    );
+
+    if (estimates.length === 0) {
+      return res.json([]);
+    }
+
+    // Get estimate IDs for parts lookup
+    const estimateIds = estimates.map(e => e.id);
+
+    // Get all parts for the found estimates
+    const [parts] = await db.promise().query(
+      `SELECT 
+        id,
+        estimate_id,
+        part_no,
+        part_description,
+        rate,
+        quantity,
+        (rate * quantity) as amount
+      FROM estimate_parts 
+      WHERE estimate_id IN (?)`,
+      [estimateIds]
+    );
+
+    // Group parts by estimate ID
+    const partsByEstimate = parts.reduce((acc, part) => {
+      if (!acc[part.estimate_id]) {
+        acc[part.estimate_id] = [];
+      }
+      acc[part.estimate_id].push(part);
+      return acc;
+    }, {});
+
+    // Combine estimates with their parts
+    const results = estimates.map(estimate => ({
+      estimate_id: estimate.id,
+      name: estimate.name,
+      address: estimate.address,
+      contact: estimate.contact,
+      email: estimate.email,
+      model: estimate.model,
+      reg_no: estimate.reg_no,
+      estimate_date: estimate.estimate_date,
+      total_amount: estimate.total_amount,
+      parts: partsByEstimate[estimate.id] || []
+    }));
+
+    res.json(results);
+    
+  } catch (error) {
+    console.error('Error searching estimates:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to search estimates',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
+ * @route GET /estimate/:id
+ * @desc Get estimate details by ID
+ * @access Public
+ */
+app.get('/estimate/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Get estimate details
+    const [estimates] = await db.promise().query(
+      `SELECT * FROM estimates WHERE id = ?`,
+      [id]
+    );
+
+    if (estimates.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Estimate not found'
+      });
+    }
+
+    const estimate = estimates[0];
+
+    // Get estimate parts
+    const [parts] = await db.promise().query(
+      `SELECT * FROM estimate_parts WHERE estimate_id = ?`,
+      [id]
+    );
+
+    res.json({
+      ...estimate,
+      parts
+    });
+    
+  } catch (error) {
+    console.error('Error fetching estimate:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch estimate',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+
 
 
 // Start Server
