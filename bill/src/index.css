@@ -3,18 +3,30 @@
 @tailwind utilities;
 
 
-@layer base {
-  :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
-  }
+:root {
+  font-size: 16px;
+}
 
-  .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 0 0% 100%;
-  }
+/* Dark mode styles */
+.dark {
+  color-scheme: dark;
 }
 
 body {
-  font-feature-settings: "rlig" 1, "calt" 1;
+  transition: background-color 200ms ease-in-out;
 }
+
+/* Font size variations */
+html[style*="font-size: 14px"] {
+  font-size: 14px;
+}
+
+html[style*="font-size: 18px"] {
+  font-size: 18px;
+}
+
+/* Dark mode background transitions */
+.dark body {
+  background-color: rgb(17, 24, 39);
+}
+
