@@ -477,43 +477,62 @@ app.delete("/delete-invoice/:id", async (req, res) => {
   const { id } = req.params;
   const { invoice_type } = req.body;
 
+  // Validate input
+  if (!id || !invoice_type) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
+
   try {
-    let query, params;
-    
+    let deleteQuery, deleteParams;
+    let deleteSummaryQuery, deleteSummaryParams;
+
     if (invoice_type === 'tax') {
-      query = "DELETE FROM invoices WHERE invoice_id = ?";
-      params = [id];
+      // First delete from invoice_summary (child table)
+      deleteSummaryQuery = "DELETE FROM invoice_summary WHERE customer_name = ?";
+      deleteSummaryParams = [id];
+      
+      // Then delete from invoices (parent table)
+      deleteQuery = "DELETE FROM invoices WHERE invoice_id = ?";
+      deleteParams = [id];
     } else if (invoice_type === 'labour') {
-      query = "DELETE FROM labour_invoices WHERE invoice_number = ?";
-      params = [id];
+      deleteQuery = "DELETE FROM labour_invoices WHERE invoice_number = ?";
+      deleteParams = [id];
     } else {
       return res.status(400).json({ error: "Invalid invoice type" });
     }
 
-    const [result] = await db.promise().query(query, params);
+    // For tax invoices, delete summary first then main invoice
+    if (invoice_type === 'tax') {
+      await db.promise().query(deleteSummaryQuery, deleteSummaryParams);
+    }
+
+    // Delete the main invoice record
+    const [result] = await db.promise().query(deleteQuery, deleteParams);
 
     if (result.affectedRows === 0) {
       return res.status(404).json({ error: "Invoice not found" });
     }
 
-    // Also delete related records if needed
-    if (invoice_type === 'tax') {
-      await db.promise().query(
-        "DELETE FROM invoice_summary WHERE invoice_id = ?",
-        [id]
-      );
-    }
-
-    res.json({ success: true, message: "Invoice deleted successfully" });
+    res.json({ 
+      success: true, 
+      message: "Invoice deleted successfully",
+      deletedId: id
+    });
+    
   } catch (error) {
-    console.error("Error deleting invoice:", error);
+    console.error("Error deleting invoice:", {
+      error: error.message,
+      stack: error.stack,
+      sql: error.sql
+    });
+    
     res.status(500).json({ 
-      error: "Internal server error",
-      details: error.message 
+      error: "Failed to delete invoice",
+      details: error.message,
+      type: "database_error"
     });
   }
 });
-
 app.get("/latest-invoice-id", async (req, res) => {
   try {
     const [rows] = await db.promise().execute("SELECT MAX(invoice_id) AS latestId FROM invoices");
