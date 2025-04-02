@@ -183,58 +183,100 @@ app.post("/save-invoice", async (req, res) => {
   const { customerDetails, selectedParts } = req.body;
 
   try {
-    // Insert invoice
-    const invoiceQuery = `
-      INSERT INTO invoices 
-      (name, address, contact, email, model, reg_no, invoice_date) 
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `;
-    
-    const invoiceValues = [
-      customerDetails.name,
-      customerDetails.address,
-      customerDetails.contact,
-      customerDetails.email,
-      customerDetails.model,
-      customerDetails.regNo,
-      customerDetails.invoiceDate
-    ];
+    // Start a transaction to ensure both operations succeed or fail together
+    const connection = await db.promise().getConnection();
+    await connection.beginTransaction();
 
-    // Using promise-based query
-    const [invoiceResult] = await db.promise().query(invoiceQuery, invoiceValues);
-    const invoiceId = invoiceResult.insertId;
-
-    // Insert each part
-    for (const part of selectedParts) {
-      const partQuery = `
-        INSERT INTO invoice_parts 
-        (invoice_id, part_no, part_description, qty, rate, sgst, cgst) 
+    try {
+      // 1. Insert invoice
+      const invoiceQuery = `
+        INSERT INTO invoices 
+        (name, address, contact, email, model, reg_no, invoice_date) 
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `;
       
-      const partValues = [
-        invoiceId,
-        part.part_no || '',
-        part.part_description || '',
-        part.quantity || 1,
-        part.rate || 0,
-        part.sgst || 0,
-        part.cgst || 0
+      const invoiceValues = [
+        customerDetails.name,
+        customerDetails.address,
+        customerDetails.contact,
+        customerDetails.email,
+        customerDetails.model,
+        customerDetails.regNo,
+        customerDetails.invoiceDate
       ];
 
-      await db.promise().query(partQuery, partValues);
-    }
+      const [invoiceResult] = await connection.query(invoiceQuery, invoiceValues);
+      const invoiceId = invoiceResult.insertId;
 
-    res.status(200).json({ 
-      message: "Invoice saved successfully",
-      invoiceId: invoiceId
-    });
+      // 2. Insert each part into invoice_parts AND update stock in parts table
+      for (const part of selectedParts) {
+        // Insert into invoice_parts
+        const partQuery = `
+          INSERT INTO invoice_parts 
+          (invoice_id, part_no, part_description, qty, rate, sgst, cgst) 
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `;
+        
+        const partValues = [
+          invoiceId,
+          part.part_no || '',
+          part.part_description || '',
+          part.quantity || 1,
+          part.rate || 0,
+          part.sgst || 0,
+          part.cgst || 0,
+          part.hsn_sac || ''
+        ];
+
+        await connection.query(partQuery, partValues);
+
+        // Update the parts table to reduce quantity
+        const updateStockQuery = `
+          UPDATE parts 
+          SET qty = qty - ? 
+          WHERE part_no = ? AND qty >= ?
+        `;
+        
+        const updateValues = [
+          part.quantity || 1,
+          part.part_no,
+          part.quantity || 1
+        ];
+
+        const [updateResult] = await connection.query(updateStockQuery, updateValues);
+
+        // Check if any rows were affected (part exists and had sufficient quantity)
+        if (updateResult.affectedRows === 0) {
+          throw new Error(`Insufficient stock or part not found: ${part.part_no}`);
+        }
+      }
+
+      // Commit the transaction if all operations succeeded
+      await connection.commit();
+      connection.release();
+
+      res.status(200).json({ 
+        message: "Invoice saved successfully",
+        invoiceId: invoiceId
+      });
+
+    } catch (error) {
+      // Rollback the transaction if any error occurred
+      await connection.rollback();
+      connection.release();
+      throw error; // This will be caught by the outer catch
+    }
 
   } catch (error) {
     console.error("Error saving invoice:", error);
-    res.status(500).send("Database error");
+    res.status(500).json({ 
+      message: "Error saving invoice",
+      error: error.message 
+    });
   }
 });
+
+
 
 app.get("/invoice/:invoice_id", (req, res) => {
   const { invoice_id } = req.params;
