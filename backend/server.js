@@ -441,10 +441,28 @@ app.get("/customers", async (req, res) => {
           customer_email AS email,
           invoice_date,
           status,
-          subtotal AS total_due,
+          grand_total AS total_due,
           'labour' AS invoice_type
         FROM labour_invoices
         ORDER BY invoice_date DESC
+      `);
+      
+      res.json(rows);
+    } else if (type === 'invoice') {
+      const [rows] = await db.promise().query(`
+        SELECT 
+          id AS invoice_id,
+          customer_name AS name,
+          customer_contact AS contact,
+          customer_email AS email,
+          vehicle_model AS model,
+          estimate_date AS invoice_date,
+          total_amount AS total_due,
+          status,
+          'invoice' AS document_type
+        FROM estimates
+        WHERE document_Type = 'invoice'
+        ORDER BY estimate_date DESC
       `);
       
       res.json(rows);
@@ -459,7 +477,6 @@ app.get("/customers", async (req, res) => {
     });
   }
 });
-
 
 
 app.put("/update-status/:id", async (req, res) => {
@@ -484,6 +501,9 @@ app.put("/update-status/:id", async (req, res) => {
       params = [status, id];
     } else if (invoice_type === 'labour') {
       query = "UPDATE labour_invoices SET status = ? WHERE invoice_number = ?";
+      params = [status, id];
+    } else if (invoice_type === 'invoice') {
+      query = "UPDATE estimates SET status = ? WHERE id = ? AND document_type = 'invoice'";
       params = [status, id];
     } else {
       return res.status(400).json({ error: "Invalid invoice type" });
@@ -526,12 +546,13 @@ app.delete("/delete-invoice/:id", async (req, res) => {
 
   try {
     let deleteQuery, deleteParams;
-    let deleteSummaryQuery, deleteSummaryParams;
 
     if (invoice_type === 'tax') {
       // First delete from invoice_summary (child table)
-      deleteSummaryQuery = "DELETE FROM invoice_summary WHERE customer_name = ?";
-      deleteSummaryParams = [id];
+      await db.promise().query(
+        "DELETE FROM invoice_summary WHERE customer_name = ?", 
+        [id]
+      );
       
       // Then delete from invoices (parent table)
       deleteQuery = "DELETE FROM invoices WHERE invoice_id = ?";
@@ -539,13 +560,11 @@ app.delete("/delete-invoice/:id", async (req, res) => {
     } else if (invoice_type === 'labour') {
       deleteQuery = "DELETE FROM labour_invoices WHERE invoice_number = ?";
       deleteParams = [id];
+    } else if (invoice_type === 'invoice') {
+      deleteQuery = "DELETE FROM estimates WHERE id = ? AND document_type = 'invoice'";
+      deleteParams = [id];
     } else {
       return res.status(400).json({ error: "Invalid invoice type" });
-    }
-
-    // For tax invoices, delete summary first then main invoice
-    if (invoice_type === 'tax') {
-      await db.promise().query(deleteSummaryQuery, deleteSummaryParams);
     }
 
     // Delete the main invoice record
@@ -562,19 +581,25 @@ app.delete("/delete-invoice/:id", async (req, res) => {
     });
     
   } catch (error) {
-    console.error("Error deleting invoice:", {
-      error: error.message,
-      stack: error.stack,
-      sql: error.sql
-    });
-    
+    console.error("Error deleting invoice:", error);
     res.status(500).json({ 
       error: "Failed to delete invoice",
-      details: error.message,
-      type: "database_error"
+      details: error.message
     });
   }
 });
+
+
+
+
+
+
+
+
+
+
+
+
 app.get("/latest-invoice-id", async (req, res) => {
   try {
     const [rows] = await db.promise().execute("SELECT MAX(invoice_id) AS latestId FROM invoices");
@@ -628,6 +653,17 @@ app.get('/invoices-details', (req, res) => {
       status,
       'labour' AS invoice_type
     FROM labour_invoices)
+    UNION ALL
+    (SELECT 
+      customer_name,
+      customer_address,
+      customer_contact,
+      customer_email,
+      estimate_date AS invoice_date,
+      status,
+      'invoice' AS document_type
+    FROM estimates
+    WHERE document_type = 'invoice')
     ORDER BY invoice_date DESC
   `;
 
@@ -825,11 +861,11 @@ app.get('/search-invoices', async (req, res) => {
 app.post('/service-estimate', async (req, res) => {
   let connection;
   try {
-    const { customerDetails, selectedParts, totalDue } = req.body;
+    const { customerDetails, selectedParts, totalDue, documentType } = req.body;
     
     // Validate required fields including totalDue
     if (!customerDetails?.name || !selectedParts || !Array.isArray(selectedParts) || 
-        totalDue === undefined || totalDue === null) {
+        totalDue === undefined || totalDue === null|| !documentType) {
       return res.status(400).json({
         success: false,
         message: 'Missing required fields or invalid total amount'
@@ -850,8 +886,8 @@ app.post('/service-estimate', async (req, res) => {
     const [estimateResult] = await connection.query(
       `INSERT INTO estimates 
       (customer_name, customer_address, customer_contact, customer_email, 
-       vehicle_model, vehicle_reg_no, estimate_date, total_amount) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       vehicle_model, vehicle_reg_no, estimate_date, total_amount, document_type) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         customerDetails.name,
         customerDetails.address || null,
@@ -860,7 +896,8 @@ app.post('/service-estimate', async (req, res) => {
         customerDetails.model || null,
         customerDetails.regNo || null,
         customerDetails.estimateDate || new Date().toISOString().split('T')[0],
-        finalTotal  // Using the calculated total
+        finalTotal,
+        documentType  // Using the calculated total
       ]
     );
     
@@ -971,7 +1008,7 @@ app.get('/latest-estimate-id', async (req, res) => {
 
 app.get('/search-estimates', async (req, res) => {
   try {
-    const { name } = req.query;
+    const { name, documentType } = req.query;
     
     if (!name) {
       return res.status(400).json({
@@ -980,9 +1017,9 @@ app.get('/search-estimates', async (req, res) => {
       });
     }
 
-    // Search estimates by customer name
-    const [estimates] = await db.promise().query(
-      `SELECT 
+    // Base query
+    let query = `
+      SELECT 
         e.id,
         e.customer_name as name,
         e.customer_address as address,
@@ -991,19 +1028,31 @@ app.get('/search-estimates', async (req, res) => {
         e.vehicle_model as model,
         e.vehicle_reg_no as reg_no,
         e.estimate_date,
-        e.total_amount
+        e.total_amount,
+        e.document_type
       FROM estimates e 
       WHERE e.customer_name LIKE ? 
-      ORDER BY e.estimate_date DESC`,
-      [`%${name}%`]
-    );
+    `;
+    
+    const queryParams = [`%${name}%`];
 
-    if (estimates.length === 0) {
+    // Add document type filter if specified
+    if (documentType) {
+      query += ' AND e.document_type = ?';
+      queryParams.push(documentType);
+    }
+
+    query += ' ORDER BY e.estimate_date DESC';
+
+    // Execute the query
+    const [documents] = await db.promise().query(query, queryParams);
+
+    if (documents.length === 0) {
       return res.json([]);
     }
 
     // Get estimate IDs for parts lookup
-    const estimateIds = estimates.map(e => e.id);
+    const estimateIds = documents.map(d => d.id);
 
     // Get all parts for the found estimates
     const [parts] = await db.promise().query(
@@ -1021,7 +1070,7 @@ app.get('/search-estimates', async (req, res) => {
     );
 
     // Group parts by estimate ID
-    const partsByEstimate = parts.reduce((acc, part) => {
+    const partsByDocument = parts.reduce((acc, part) => {
       if (!acc[part.estimate_id]) {
         acc[part.estimate_id] = [];
       }
@@ -1029,31 +1078,33 @@ app.get('/search-estimates', async (req, res) => {
       return acc;
     }, {});
 
-    // Combine estimates with their parts
-    const results = estimates.map(estimate => ({
-      estimate_id: estimate.id,
-      name: estimate.name,
-      address: estimate.address,
-      contact: estimate.contact,
-      email: estimate.email,
-      model: estimate.model,
-      reg_no: estimate.reg_no,
-      estimate_date: estimate.estimate_date,
-      total_amount: estimate.total_amount,
-      parts: partsByEstimate[estimate.id] || []
+    // Combine documents with their parts
+    const results = documents.map(document => ({
+      estimate_id: document.id,  // Changed from document.estimate_id to document.id
+      name: document.name,
+      address: document.address,
+      contact: document.contact,
+      email: document.email,
+      model: document.model,
+      reg_no: document.reg_no,
+      estimate_date: document.estimate_date,
+      total_amount: document.total_amount,
+      document_type: document.document_type || 'estimate',
+      parts: partsByDocument[document.id] || []
     }));
 
     res.json(results);
     
   } catch (error) {
-    console.error('Error searching estimates:', error);
+    console.error('Error searching documents:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to search estimates',
+      message: 'Failed to search documents',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
+
 
 /**
  * @route GET /estimate/:id
@@ -1115,10 +1166,12 @@ function generateLabourInvoiceNumber() {
 app.post('/save-labour-invoice', (req, res) => {
   const { customerDetails, labourItems } = req.body;
   
-  // Calculate grand total
-  const grandTotal = labourItems.reduce((sum, item) => sum + parseFloat(item.total), 0);
-  
-  // Start transaction
+  // Calculate totals
+  const subtotal = labourItems.reduce((sum, item) => sum + item.subtotal, 0);
+  const totalCGST = labourItems.reduce((sum, item) => sum + (item.subtotal * item.cgst / 100), 0);
+  const totalSGST = labourItems.reduce((sum, item) => sum + (item.subtotal * item.sgst / 100), 0);
+  const grandTotal = subtotal + totalCGST + totalSGST;
+
   db.getConnection((err, connection) => {
     if (err) {
       console.error('Error getting connection:', err);
@@ -1133,36 +1186,88 @@ app.post('/save-labour-invoice', (req, res) => {
       }
       
       // Insert invoice header
-      connection.query(
-        `INSERT INTO labour_invoices (
+      const headerQuery = `
+        INSERT INTO labour_invoices (
           invoice_number, customer_name, customer_address, customer_contact, 
-          customer_email, vehicle_model, vehicle_reg_no, invoice_date, grand_total
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          generateLabourInvoiceNumber(),
-          customerDetails.name,
-          customerDetails.address,
-          customerDetails.contact,
-          customerDetails.email,
-          customerDetails.model,
-          customerDetails.regNo,
-          customerDetails.invoiceDate,
-          grandTotal
-        ],
-        (err, invoiceResult) => {
-          if (err) {
-            return connection.rollback(() => {
-              connection.release();
-              console.error('Error saving invoice header:', err);
-              res.status(500).json({ error: 'Failed to save invoice header' });
+          customer_email, vehicle_model, vehicle_reg_no, invoice_date, 
+          subtotal, cgst, sgst, grand_total
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `;
+      
+      const headerValues = [
+        generateLabourInvoiceNumber(),
+        customerDetails.name,
+        customerDetails.address,
+        customerDetails.contact,
+        customerDetails.email,
+        customerDetails.model,
+        customerDetails.regNo,
+        customerDetails.invoiceDate,
+        subtotal,
+        totalCGST,
+        totalSGST,
+        grandTotal
+      ];
+
+      connection.query(headerQuery, headerValues, (err, invoiceResult) => {
+        if (err) {
+          return connection.rollback(() => {
+            connection.release();
+            console.error('Error saving invoice header:', err);
+            res.status(500).json({ error: 'Failed to save invoice header' });
+          });
+        }
+        
+        const invoiceId = invoiceResult.insertId;
+        
+        if (labourItems.length === 0) {
+          return connection.commit(err => {
+            connection.release();
+            if (err) {
+              console.error('Error committing transaction:', err);
+              return res.status(500).json({ error: 'Transaction commit error' });
+            }
+            res.status(200).json({
+              message: 'Labour invoice saved successfully',
+              invoiceId: invoiceId
             });
-          }
-          
-          const invoiceId = invoiceResult.insertId;
-          let itemsProcessed = 0;
-          
-          if (labourItems.length === 0) {
-            return connection.commit(err => {
+          });
+        }
+        
+        // Prepare line items
+        const itemQueries = labourItems.map(item => {
+          return new Promise((resolve, reject) => {
+            const itemQuery = `
+              INSERT INTO labour_invoice_items (
+                invoice_id, sno, description, tinkering, painting, 
+                electrician, mechanical, cgst, sgst, subtotal, total
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `;
+            
+            const itemValues = [
+              invoiceId,
+              item.sno,
+              item.description,
+              item.tinkering,
+              item.painting,
+              item.electrician,
+              item.mechanical,
+              item.cgst,
+              item.sgst,
+              item.subtotal,
+              item.total
+            ];
+            
+            connection.query(itemQuery, itemValues, (err) => {
+              if (err) return reject(err);
+              resolve();
+            });
+          });
+        });
+        
+        Promise.all(itemQueries)
+          .then(() => {
+            connection.commit(err => {
               connection.release();
               if (err) {
                 console.error('Error committing transaction:', err);
@@ -1173,55 +1278,15 @@ app.post('/save-labour-invoice', (req, res) => {
                 invoiceId: invoiceId
               });
             });
-          }
-          
-          // Insert invoice items
-          labourItems.forEach(item => {
-            connection.query(
-              `INSERT INTO labour_invoice_items (
-                invoice_id, sno, description, tinkering, painting, 
-                electrician, mechanical, cgst, sgst, total
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-              [
-                invoiceId,
-                item.sno,
-                item.description,
-                item.tinkering,
-                item.painting,
-                item.electrician,
-                item.mechanical,
-                item.cgst,
-                item.sgst,
-                item.total
-              ],
-              (err) => {
-                if (err) {
-                  return connection.rollback(() => {
-                    connection.release();
-                    console.error('Error saving invoice item:', err);
-                    res.status(500).json({ error: 'Failed to save invoice items' });
-                  });
-                }
-                
-                itemsProcessed++;
-                if (itemsProcessed === labourItems.length) {
-                  connection.commit(err => {
-                    connection.release();
-                    if (err) {
-                      console.error('Error committing transaction:', err);
-                      return res.status(500).json({ error: 'Transaction commit error' });
-                    }
-                    res.status(200).json({
-                      message: 'Labour invoice saved successfully',
-                      invoiceId: invoiceId
-                    });
-                  });
-                }
-              }
-            );
+          })
+          .catch(err => {
+            connection.rollback(() => {
+              connection.release();
+              console.error('Error saving invoice items:', err);
+              res.status(500).json({ error: 'Failed to save invoice items' });
+            });
           });
-        }
-      );
+      });
     });
   });
 });
@@ -1254,97 +1319,54 @@ app.get('/latest-labour-invoice-id', (req, res) => {
 });
 
 app.post('/labour-invoice-summary', (req, res) => {
-  const { customerName, invoiceDate, subtotal, cgst, sgst, totalDue } = req.body;
+  const { customerName, invoiceDate, subtotal, cgst, sgst, totalDue, labourItems, invoiceId } = req.body;
 
-  // First generate a new invoice ID
   db.getConnection((err, connection) => {
     if (err) {
       console.error('Error getting connection:', err);
       return res.status(500).json({ error: 'Database connection error' });
     }
 
-    // Start transaction
-    connection.beginTransaction(err => {
-      if (err) {
-        connection.release();
-        return res.status(500).json({ error: 'Transaction error' });
-      }
+    // Generate reference number (LAB + YYMM + random 4 digits)
+    const referenceNumber = 'LAB' + 
+      new Date().getFullYear().toString().slice(-2) + 
+      (new Date().getMonth() + 1).toString().padStart(2, '0') + 
+      Math.floor(1000 + Math.random() * 9000);
 
-      // 1. First create the main invoice record
-      const invoiceNumber = 'LAB' + new Date().getFullYear().toString().slice(-2) + 
-                          (new Date().getMonth() + 1).toString().padStart(2, '0') + 
-                          Math.floor(1000 + Math.random() * 9000);
-
-      connection.query(
-        `INSERT INTO labour_invoices (
-          invoice_number, customer_name, invoice_date, subtotal, 
-          cgst, sgst, grand_total
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [
-          invoiceNumber,
-          customerName,
-          invoiceDate,
-          subtotal,
-          cgst,
-          sgst,
-          totalDue
-        ],
-        (err, invoiceResult) => {
-          if (err) {
-            return connection.rollback(() => {
-              connection.release();
-              console.error('Error creating invoice:', err);
-              res.status(500).json({ error: 'Failed to create invoice' });
-            });
-          }
-
-          const invoiceId = invoiceResult.insertId;
-
-          // 2. Then create the summary record
-          connection.query(
-            `INSERT INTO labour_invoice_summaries (
-              invoice_id, customer_name, invoice_date, subtotal, cgst, sgst, total_due
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [
-              invoiceId,
-              customerName,
-              invoiceDate,
-              subtotal,
-              cgst,
-              sgst,
-              totalDue
-            ],
-            (err) => {
-              if (err) {
-                return connection.rollback(() => {
-                  connection.release();
-                  console.error('Error saving invoice summary:', err);
-                  res.status(500).json({ error: 'Failed to save invoice summary' });
-                });
-              }
-
-              // Commit transaction if both succeed
-              connection.commit(err => {
-                connection.release();
-                if (err) {
-                  console.error('Error committing transaction:', err);
-                  return res.status(500).json({ error: 'Transaction commit error' });
-                }
-
-                res.status(200).json({ 
-                  message: 'Labour invoice and summary saved successfully',
-                  invoiceId: invoiceId,
-                  invoiceNumber: invoiceNumber
-                });
-              });
-            }
-          );
+    // Insert into labour_invoice_summaries only
+    connection.query(
+      `INSERT INTO labour_invoice_summaries (
+        reference_number, invoice_id, customer_name, invoice_date, 
+        subtotal, cgst, sgst, total_due, labour_items
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        referenceNumber,
+        invoiceId || null, // Use null if invoiceId is not provided
+        customerName,
+        invoiceDate,
+        subtotal,
+        cgst,
+        sgst,
+        totalDue,
+        JSON.stringify(labourItems) // Store line items as JSON
+      ],
+      (err, result) => {
+        connection.release(); // Always release connection
+        
+        if (err) {
+          console.error('Error saving labour invoice summary:', err);
+          return res.status(500).json({ error: 'Failed to save labour invoice summary' });
         }
-      );
-    });
+
+        res.status(200).json({ 
+          message: 'Labour invoice summary saved successfully',
+          referenceNumber: referenceNumber,
+          invoiceId: invoiceId || null // Return invoiceId if it exists
+        });
+      }
+    );
   });
 });
-
 
 app.get('/search-labour-invoices', (req, res) => {
   const customerName = req.query.name || '';
@@ -1480,6 +1502,7 @@ app.get('/invoice-stats', (req, res) => {
     );
   });
 });
+
 
 // Start Server
 const PORT = process.env.PORT || 5000;
