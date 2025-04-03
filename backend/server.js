@@ -1165,7 +1165,7 @@ function generateLabourInvoiceNumber() {
 // Save labour invoice (callback version)
 app.post('/save-labour-invoice', (req, res) => {
   const { customerDetails, labourItems } = req.body;
-  
+  const formattedDate = new Date(customerDetails.invoiceDate).toISOString().split('T')[0];
   // Calculate totals
   const subtotal = labourItems.reduce((sum, item) => sum + item.subtotal, 0);
   const totalCGST = labourItems.reduce((sum, item) => sum + (item.subtotal * item.cgst / 100), 0);
@@ -1202,7 +1202,7 @@ app.post('/save-labour-invoice', (req, res) => {
         customerDetails.email,
         customerDetails.model,
         customerDetails.regNo,
-        customerDetails.invoiceDate,
+        formattedDate,
         subtotal,
         totalCGST,
         totalSGST,
