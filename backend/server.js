@@ -1165,11 +1165,25 @@ function generateLabourInvoiceNumber() {
 // Save labour invoice (callback version)
 app.post('/save-labour-invoice', (req, res) => {
   const { customerDetails, labourItems } = req.body;
-  const formattedDate = new Date(customerDetails.invoiceDate).toISOString().split('T')[0];
-  // Calculate totals
-  const subtotal = labourItems.reduce((sum, item) => sum + item.subtotal, 0);
-  const totalCGST = labourItems.reduce((sum, item) => sum + (item.subtotal * item.cgst / 100), 0);
-  const totalSGST = labourItems.reduce((sum, item) => sum + (item.subtotal * item.sgst / 100), 0);
+  
+  // Safely format values for database insertion
+  const formatForDB = (value) => {
+    if (value === '' || value === null || value === undefined) return 0;
+    return isNaN(parseFloat(value)) ? 0 : parseFloat(value);
+  };
+
+  // Calculate totals with safe number handling
+  const subtotal = labourItems.reduce((sum, item) => sum + formatForDB(item.subtotal), 0);
+  const totalCGST = labourItems.reduce((sum, item) => {
+    const itemSubtotal = formatForDB(item.subtotal);
+    const itemCGST = formatForDB(item.cgst);
+    return sum + (itemSubtotal * itemCGST / 100);
+  }, 0);
+  const totalSGST = labourItems.reduce((sum, item) => {
+    const itemSubtotal = formatForDB(item.subtotal);
+    const itemSGST = formatForDB(item.sgst);
+    return sum + (itemSubtotal * itemSGST / 100);
+  }, 0);
   const grandTotal = subtotal + totalCGST + totalSGST;
 
   db.getConnection((err, connection) => {
@@ -1196,13 +1210,13 @@ app.post('/save-labour-invoice', (req, res) => {
       
       const headerValues = [
         generateLabourInvoiceNumber(),
-        customerDetails.name,
-        customerDetails.address,
-        customerDetails.contact,
-        customerDetails.email,
-        customerDetails.model,
-        customerDetails.regNo,
-        formattedDate,
+        customerDetails.name || '',
+        customerDetails.address || '',
+        customerDetails.contact || '',
+        customerDetails.email || '',
+        customerDetails.model || '',
+        customerDetails.regNo || '',
+        customerDetails.invoiceDate || new Date().toISOString().split('T')[0],
         subtotal,
         totalCGST,
         totalSGST,
@@ -1220,21 +1234,7 @@ app.post('/save-labour-invoice', (req, res) => {
         
         const invoiceId = invoiceResult.insertId;
         
-        if (labourItems.length === 0) {
-          return connection.commit(err => {
-            connection.release();
-            if (err) {
-              console.error('Error committing transaction:', err);
-              return res.status(500).json({ error: 'Transaction commit error' });
-            }
-            res.status(200).json({
-              message: 'Labour invoice saved successfully',
-              invoiceId: invoiceId
-            });
-          });
-        }
-        
-        // Prepare line items
+        // Process line items with safe value handling
         const itemQueries = labourItems.map(item => {
           return new Promise((resolve, reject) => {
             const itemQuery = `
@@ -1246,16 +1246,16 @@ app.post('/save-labour-invoice', (req, res) => {
             
             const itemValues = [
               invoiceId,
-              item.sno,
-              item.description,
-              item.tinkering,
-              item.painting,
-              item.electrician,
-              item.mechanical,
-              item.cgst,
-              item.sgst,
-              item.subtotal,
-              item.total
+              formatForDB(item.sno),
+              item.description || '',
+              formatForDB(item.tinkering),
+              formatForDB(item.painting),
+              formatForDB(item.electrician),
+              formatForDB(item.mechanical),
+              formatForDB(item.cgst),
+              formatForDB(item.sgst),
+              formatForDB(item.subtotal),
+              formatForDB(item.total)
             ];
             
             connection.query(itemQuery, itemValues, (err) => {
